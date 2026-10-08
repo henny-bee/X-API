@@ -1,0 +1,14 @@
+services:
+  x-poster:
+    build: .
+    restart: unless-stopped
+    environment:
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env}
+      MIN_INTERVAL_SECONDS: "60"
+      # ALLOW_PRIVATE_MEDIA_URLS: "true"   # only if your media is on an internal host (e.g. MinIO)
+    volumes:
+      - ./data:/data          # contains storage_state.json (secret!)
+    shm_size: "1gb"
+    ports:
+      - "127.0.0.1:8000:8000" # localhost only. Do NOT expose to the internet.
+    # If n8n runs in the same compose project, remove "ports" and call http://x-poster:8000
