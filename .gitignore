@@ -1,0 +1,11 @@
+/target/
+/data/
+storage_state.json
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

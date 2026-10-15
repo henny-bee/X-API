@@ -1,81 +1,153 @@
-# X poster (login session backend)
+# X Poster (Rust Backend)
 
-Backend kecil yang posting teks + gambar/video ke X lewat session login yang tersimpan (Playwright), dan diekspos sebagai endpoint HTTP untuk n8n. Tidak memakai API resmi X.
+HTTP service written in Rust (Axum + Chrome DevTools Protocol) that posts text, images, and videos to X (`x.com`) using a saved browser session cookie. Built to be called from n8n or any HTTP client.
 
 ```
-n8n (HTTP Request) -> x-poster (FastAPI) -> Chromium + saved session -> x.com
+n8n / HTTP Client -> x-poster (Axum/Rust) -> Headless Chromium (CDP) -> x.com
 ```
 
-## 1. Simpan session login (sekali saja, di komputer yang punya layar)
+## Project Structure
 
-```bash
-pip install -r requirements.txt
-playwright install chromium
-python login.py
+```
+.
+├── Cargo.toml
+├── Dockerfile
+├── docker-compose.yml
+└── src/
+    ├── main.rs          # HTTP server entrypoint and graceful shutdown
+    ├── lib.rs           # Module exports and integration tests
+    ├── config.rs        # Environment variable configuration
+    ├── error.rs         # HTTP error responses and Retry-After headers
+    ├── state.rs         # Shared state, concurrency lock, and rate limiter
+    ├── media.rs         # Media validation, SSRF-safe downloader, and size limits
+    ├── browser/
+    │   ├── mod.rs       # X compose automation and session persistence
+    │   └── cdp.rs       # Chromium process manager and WebSocket CDP client
+    └── routes/
+        ├── mod.rs       # Axum router and x-token authentication
+        ├── health.rs    # GET /health
+        ├── session.rs   # POST /session and DELETE /session
+        └── post.rs      # POST /post and POST /post/upload
 ```
 
-Login manual di jendela yang terbuka (termasuk 2FA), tunggu timeline muncul, lalu tekan Enter di terminal.
-Hasilnya: `data/storage_state.json`. **File ini sama sensitifnya dengan password.** Jangan di-commit ke git.
+## 1. Get Your X Session Cookies
 
-## 2. Jalankan
+1. Open `https://x.com` in your browser (an Incognito/Private window is recommended) and log in.
+2. Open DevTools (`F12`) -> **Application** tab (**Storage** in Firefox) -> **Cookies** -> `https://x.com`.
+3. Click each row below and copy the full **Value** string:
+   - `auth_token` (required)
+   - `ct0` (recommended)
+   - Other cookies (`__cf_bm`, `cf_clearance`, `guest_id`, `twid`, `d_prefs`) are not needed.
+4. Close the browser tab when done. Do not click **Log out**, because logging out invalidates the `auth_token` cookie on X's servers.
 
-Lokal:
-```bash
-export API_TOKEN="$(openssl rand -hex 32)"
-uvicorn server:app --host 127.0.0.1 --port 8000
-```
+## 2. Run the Server and Save Your Session
 
-Docker (deploy):
+### Start the Server
+
+With Docker Compose:
 ```bash
 echo "API_TOKEN=$(openssl rand -hex 32)" > .env
-mkdir -p data && cp /path/ke/storage_state.json data/
 docker compose up -d --build
-curl http://127.0.0.1:8000/health   # {"ok":true,"session_saved":true}
 ```
 
-## 3. Endpoint
+Or run locally with Cargo (requires Chromium or Chrome installed):
+```bash
+export API_TOKEN="$(openssl rand -hex 32)"
+export HOST=127.0.0.1
+export PORT=8001
+cargo run --release
+```
 
-Semua POST butuh header `x-token: <API_TOKEN>`.
+### Save Session via `POST /session`
 
-**`POST /post`** (JSON, media dari URL publik)
+Send your `auth_token` (and optional `ct0`) to `/session`:
+
+```bash
+curl -X POST http://127.0.0.1:8001/session \
+  -H "x-token: $API_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"auth_token": "YOUR_AUTH_TOKEN", "ct0": "YOUR_CT0"}'
+```
+
+Or send a raw `Cookie` header string copied from DevTools:
+
+```bash
+curl -X POST http://127.0.0.1:8001/session \
+  -H "x-token: $API_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"cookie": "auth_token=xxx; ct0=yyy"}'
+```
+
+The session is stored in `data/storage_state.json` and refreshed automatically after each successful post.
+
+## 3. HTTP Endpoints
+
+Every endpoint except `GET /health` requires the `x-token: <API_TOKEN>` header.
+
+### `GET /health`
+Returns server and session status:
 ```json
-{ "text": "Caption kamu", "media_urls": ["https://.../gambar.jpg"] }
+{ "ok": true, "session_saved": true }
 ```
 
-**`POST /post/upload`** (multipart, kirim file langsung dari n8n)
-- field `text`: caption
-- field `files`: binary (ulang field untuk banyak gambar)
+### `POST /session`
+Saves or updates the X session cookies (`auth_token` + optional `ct0`, raw `cookie` string, or `cookies` array).
 
-Aturan media: maksimal 4 gambar (jpg/png/webp), atau 1 video (mp4/mov), atau 1 gif. Tidak boleh dicampur.
+### `DELETE /session`
+Removes the saved `storage_state.json` file.
 
-Respons:
-- `{"ok": true, "status": "posted", "url": ...}` berhasil
-- `{"ok": null, "status": "unconfirmed"}` post mungkin sudah terkirim tapi tidak terkonfirmasi, **cek manual dulu sebelum mengulang**
-- `401` session habis, jalankan `login.py` lagi
-- `429` terlalu cepat (default minimal 60 detik antar post)
-- `409` ada post lain yang sedang berjalan
+### `POST /post` (JSON with public media URLs)
+```json
+{
+  "text": "Post caption",
+  "media_urls": ["https://example.com/image.jpg"]
+}
+```
 
-## 4. Setting node HTTP Request di n8n
+### `POST /post/upload` (multipart/form-data with binary files)
+Form fields:
+- `text` (Text): post caption
+- `files` (File): binary media file (repeat the `files` field to attach up to 4 images)
 
-| Field | Isi |
+Media rules enforced by X: up to 4 images (`.jpg`, `.jpeg`, `.png`, `.webp`), or 1 GIF (`.gif`), or 1 video (`.mp4`, `.mov`). Videos and GIFs cannot be combined with other attachments.
+
+### `/post` Responses
+- `200 OK`: `{"ok": true, "status": "posted", "url": "https://x.com/.../status/..."}` when confirmed.
+- `200 OK`: `{"ok": null, "status": "unconfirmed", "url": null}` if the post button was clicked but completion could not be verified within 30 seconds. Check the account timeline before retrying.
+- `401 Unauthorized`: invalid `x-token` or expired X session.
+- `409 Conflict`: another post is currently running.
+- `429 Too Many Requests`: minimum interval between posts has not elapsed (includes `Retry-After` header).
+- `502 Bad Gateway`: X rejected the post (such as duplicate text) or the compose UI could not be loaded.
+- `504 Gateway Timeout`: media processing or page navigation timed out.
+
+## 4. n8n HTTP Request Node Configuration
+
+| Field | Value |
 |---|---|
-| Method | POST |
-| URL | `http://x-poster:8000/post` (satu compose network) atau `http://host.docker.internal:8000/post` |
-| Headers | `x-token` = API_TOKEN |
+| Method | `POST` |
+| URL | `http://x-poster:8000/post` (same Compose network) or `http://host.docker.internal:8001/post` |
+| Headers | `x-token` = `API_TOKEN` |
 | Body (JSON) | `{{ JSON.stringify({ text: $json.caption, media_urls: [$json.media_url] }) }}` |
-| Options > Timeout | 600000 (video bisa lama diupload) |
-| Settings > Retry On Fail | **Matikan**, supaya tidak terjadi post ganda |
+| Options > Timeout | `600000` |
+| Settings > Retry On Fail | Disabled (prevents duplicate posts) |
 
-Untuk kirim file binary: Body Content Type = `Form-Data`, tambah parameter `text` (Text) dan `files` (n8n Binary File, isi nama field binary-nya), URL `/post/upload`.
+To upload binary files from n8n, set Body Content Type to `Form-Data`, add `text` (Text) and `files` (n8n Binary File), and call `/post/upload`.
 
-Contoh workflow siap import ada di `n8n_workflow.json` (Import from File).
+## 5. Environment Variables
 
-## 5. Catatan penting
-
-- **Melanggar ToS X.** Akun bisa kena limit, shadowban, atau suspend. Pakai akun cadangan dulu, jaga frekuensi rendah dan variatif.
-- **Selector bisa berubah.** Semua selector ada di bagian atas `server.py`. Kalau gagal, lihat screenshot di `data/debug/`.
-- Session bisa kedaluwarsa atau diminta verifikasi ulang oleh X. Kalau dapat `401`, jalankan `login.py` lagi.
-- Jangan buka port ke internet. Biarkan hanya `127.0.0.1` atau jaringan Docker internal.
-- URL media diblokir kalau menunjuk ke IP privat (anti-SSRF). Set `ALLOW_PRIVATE_MEDIA_URLS=true` hanya kalau media kamu ada di host internal.
-- Batas teks default 280 karakter. Ubah lewat `MAX_TEXT_CHARS` kalau akunmu Premium.
-- Video: batas durasi dan ukuran mengikuti aturan akun X-mu.
+| Variable | Default | Description |
+|---|---|---|
+| `API_TOKEN` | *(required)* | Secret token verified against the `x-token` request header |
+| `HOST` | `0.0.0.0` | HTTP server bind address |
+| `PORT` | `8000` | Internal HTTP server port |
+| `HOST_PORT` | `8001` | Host port mapped by `docker-compose.yml` (`127.0.0.1:8001->8000`) |
+| `STATE_FILE` | `./data/storage_state.json` | Path where session cookies are persisted |
+| `DEBUG_DIR` | `./data/debug` | Directory where failure screenshots are saved |
+| `HEADLESS` | `true` | Run Chromium in headless mode (`false` to show window) |
+| `MIN_INTERVAL_SECONDS` | `60` | Minimum delay required between posts |
+| `UPLOAD_TIMEOUT_SECONDS` | `300` | Maximum wait time for X to process uploaded media |
+| `MAX_MEDIA_MB` | `512` | Maximum size per media file in megabytes |
+| `MAX_TEXT_CHARS` | `280` | Maximum character count per post |
+| `ALLOW_PRIVATE_MEDIA_URLS` | `false` | Set to `true` only when downloading media from private/internal hosts |
+| `CHROME_BIN` | *(auto-detected)* | Custom path to the Chromium or Chrome binary |
+| `CHROME_NO_SANDBOX` | `false` (`true` in Docker) | Pass `--no-sandbox` to Chromium inside containers |

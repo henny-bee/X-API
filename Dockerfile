@@ -1,14 +1,28 @@
-# Playwright image version must match the playwright version in requirements.txt
-FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
+FROM rust:1-bookworm AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs && touch src/lib.rs \
+    && cargo build --release --locked \
+    && rm -rf src
+COPY src ./src
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY server.py login.py ./
+COPY --from=builder /app/target/release/x-poster /usr/local/bin/x-poster
 
 ENV STATE_FILE=/data/storage_state.json \
-    DEBUG_DIR=/data/debug
+    DEBUG_DIR=/data/debug \
+    CHROME_BIN=/usr/bin/chromium \
+    CHROME_NO_SANDBOX=true \
+    HOST=0.0.0.0 \
+    PORT=8000
 
 VOLUME /data
 EXPOSE 8000
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["x-poster"]

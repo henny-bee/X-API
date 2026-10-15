@@ -7,8 +7,8 @@ services:
       MIN_INTERVAL_SECONDS: "60"
       # ALLOW_PRIVATE_MEDIA_URLS: "true"   # only if your media is on an internal host (e.g. MinIO)
     volumes:
-      - ./data:/data          # contains storage_state.json (secret!)
+      - ./data:/data          # stores storage_state.json and debug screenshots
     shm_size: "1gb"
     ports:
-      - "127.0.0.1:8000:8000" # localhost only. Do NOT expose to the internet.
+      - "127.0.0.1:${HOST_PORT:-8001}:8000" # localhost only. Do NOT expose to the internet.
     # If n8n runs in the same compose project, remove "ports" and call http://x-poster:8000
