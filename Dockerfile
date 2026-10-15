@@ -16,8 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=builder /app/target/release/x-poster /usr/local/bin/x-poster
 
-ENV STATE_FILE=/data/storage_state.json \
-    DEBUG_DIR=/data/debug \
+ENV DEBUG_DIR=/data/debug \
     CHROME_BIN=/usr/bin/chromium \
     CHROME_NO_SANDBOX=true \
     HOST=0.0.0.0 \

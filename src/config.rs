@@ -7,7 +7,6 @@ pub struct Config {
     pub api_token: String,
     pub host: String,
     pub port: u16,
-    pub state_file: PathBuf,
     pub debug_dir: PathBuf,
     pub headless: bool,
     pub min_interval: Duration,
@@ -31,9 +30,6 @@ impl Config {
             api_token,
             host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into()),
             port: env_parse("PORT", 8000)?,
-            state_file: PathBuf::from(
-                env::var("STATE_FILE").unwrap_or_else(|_| "./data/storage_state.json".into()),
-            ),
             debug_dir: PathBuf::from(
                 env::var("DEBUG_DIR").unwrap_or_else(|_| "./data/debug".into()),
             ),

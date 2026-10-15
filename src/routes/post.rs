@@ -11,11 +11,15 @@ use tokio::io::AsyncWriteExt;
 use crate::browser::PostResult;
 use crate::error::AppError;
 use crate::media;
-use crate::routes::require_auth;
+use crate::routes::{extract_session_cookies, require_auth};
 use crate::state::AppState;
 
 #[derive(Default, Deserialize)]
 pub struct PostIn {
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    #[serde(default)]
+    pub ct0: Option<String>,
     #[serde(default)]
     pub text: String,
     #[serde(default)]
@@ -28,6 +32,8 @@ pub async fn post_json(
     Json(body): Json<PostIn>,
 ) -> Result<Json<PostResult>, AppError> {
     require_auth(&headers, &state.config.api_token)?;
+    let (account_key, cookies) =
+        extract_session_cookies(&headers, body.auth_token.as_deref(), body.ct0.as_deref())?;
 
     let tmp = TempDir::new()
         .map_err(|e| AppError::bad_gateway(format!("failed to create temp dir: {e}")))?;
@@ -39,7 +45,9 @@ pub async fn post_json(
     }
 
     media::validate_post(&body.text, &files, state.config.max_text_chars)?;
-    let result = state.publish(&body.text, &files).await?;
+    let result = state
+        .publish(&account_key, &cookies, &body.text, &files)
+        .await?;
     Ok(Json(result))
 }
 
@@ -54,6 +62,8 @@ pub async fn post_upload(
         .map_err(|e| AppError::bad_gateway(format!("failed to create temp dir: {e}")))?;
     let max_mb = state.config.max_media_bytes / (1024 * 1024);
 
+    let mut form_auth_token: Option<String> = None;
+    let mut form_ct0: Option<String> = None;
     let mut text = String::new();
     let mut files: Vec<PathBuf> = Vec::new();
 
@@ -63,12 +73,35 @@ pub async fn post_upload(
         .map_err(|e| AppError::bad_request(format!("invalid multipart payload: {e}")))?
     {
         let name = field.name().unwrap_or("").to_string();
-        if name == "text" && field.file_name().is_none() {
-            text = field
-                .text()
-                .await
-                .map_err(|e| AppError::bad_request(format!("invalid text field: {e}")))?;
-            continue;
+        if field.file_name().is_none() {
+            match name.as_str() {
+                "text" => {
+                    text = field
+                        .text()
+                        .await
+                        .map_err(|e| AppError::bad_request(format!("invalid text field: {e}")))?;
+                    continue;
+                }
+                "auth_token" => {
+                    form_auth_token = Some(
+                        field
+                            .text()
+                            .await
+                            .map_err(|e| AppError::bad_request(format!("invalid auth_token: {e}")))?,
+                    );
+                    continue;
+                }
+                "ct0" => {
+                    form_ct0 = Some(
+                        field
+                            .text()
+                            .await
+                            .map_err(|e| AppError::bad_request(format!("invalid ct0: {e}")))?,
+                    );
+                    continue;
+                }
+                _ => {}
+            }
         }
 
         if name == "files" || field.file_name().is_some() {
@@ -109,7 +142,10 @@ pub async fn post_upload(
         }
     }
 
+    let (account_key, cookies) =
+        extract_session_cookies(&headers, form_auth_token.as_deref(), form_ct0.as_deref())?;
+
     media::validate_post(&text, &files, state.config.max_text_chars)?;
-    let result = state.publish(&text, &files).await?;
+    let result = state.publish(&account_key, &cookies, &text, &files).await?;
     Ok(Json(result))
 }

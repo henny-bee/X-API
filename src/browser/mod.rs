@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tracing::{info, warn};
 
-use crate::browser::cdp::{CdpError, CdpSession, StorageCookie, StorageState};
+use crate::browser::cdp::{CdpError, CdpSession, StorageCookie};
 use crate::config::Config;
 use crate::error::AppError;
 
@@ -24,10 +24,6 @@ pub struct PostResult {
     pub ok: Option<bool>,
     pub status: &'static str,
     pub url: Option<String>,
-}
-
-pub fn has_session(config: &Config) -> bool {
-    config.state_file.exists()
 }
 
 pub fn cookies_from_tokens(auth_token: &str, ct0: Option<&str>) -> Vec<StorageCookie> {
@@ -56,36 +52,12 @@ pub fn cookies_from_tokens(auth_token: &str, ct0: Option<&str>) -> Vec<StorageCo
     cookies
 }
 
-pub fn cookies_from_header(raw_cookie: &str) -> Vec<StorageCookie> {
-    raw_cookie
-        .split(';')
-        .filter_map(|part| {
-            let (k, v) = part.trim().split_once('=')?;
-            let name = k.trim();
-            let value = v.trim().trim_matches('"');
-            if name.is_empty() || value.is_empty() {
-                return None;
-            }
-            Some(StorageCookie {
-                name: name.into(),
-                value: value.into(),
-                domain: ".x.com".into(),
-                path: "/".into(),
-                expires: -1.0,
-                http_only: name == "auth_token",
-                secure: true,
-                same_site: Some(if name == "auth_token" { "None" } else { "Lax" }.into()),
-            })
-        })
-        .collect()
-}
-
 pub async fn run_browser(
     config: &Config,
+    cookies: &[StorageCookie],
     text: &str,
     media: &[PathBuf],
 ) -> Result<PostResult, AppError> {
-    let state = load_or_init_state(config).await?;
     let mut page = CdpSession::launch(
         config.chrome_bin.as_deref(),
         config.headless,
@@ -94,7 +66,7 @@ pub async fn run_browser(
     .await
     .map_err(|e| AppError::bad_gateway(e.to_string()))?;
 
-    let outcome = execute_post(&mut page, config, state, text, media).await;
+    let outcome = execute_post(&mut page, config, cookies, text, media).await;
     if let Err(CdpError::Timeout) = &outcome {
         snap(&mut page, &config.debug_dir, "timeout").await;
     }
@@ -104,11 +76,11 @@ pub async fn run_browser(
 async fn execute_post(
     page: &mut CdpSession,
     config: &Config,
-    mut state: StorageState,
+    cookies: &[StorageCookie],
     text: &str,
     media: &[PathBuf],
 ) -> Result<PostResult, CdpError> {
-    page.set_cookies(&state.cookies).await?;
+    page.set_cookies(cookies).await?;
     info!("opening {COMPOSE_URL}");
     page.goto(COMPOSE_URL).await?;
 
@@ -170,11 +142,6 @@ async fn execute_post(
             });
         }
     };
-
-    if let Ok(cookies) = page.get_cookies().await {
-        state.cookies = cookies;
-        let _ = save_storage_state(&config.state_file, &state).await;
-    }
 
     info!("post confirmed: {:?}", post_url);
     Ok(PostResult {
@@ -266,9 +233,9 @@ fn normalize_x_url(href: &str) -> String {
 fn map_cdp_err(err: CdpError) -> AppError {
     match err {
         CdpError::Timeout => AppError::gateway_timeout("timed out while posting"),
-        CdpError::Protocol(msg) if msg == "SESSION_EXPIRED" => AppError::unauthorized(
-            "session expired. Send a fresh session to POST /session.",
-        ),
+        CdpError::Protocol(msg) if msg == "SESSION_EXPIRED" => {
+            AppError::unauthorized("X session expired or invalid auth_token.")
+        }
         CdpError::Protocol(msg) if msg == "COMPOSE_NOT_FOUND" => {
             AppError::bad_gateway("compose box not found (UI changed or blocked)")
         }
@@ -287,41 +254,4 @@ async fn snap(page: &mut CdpSession, debug_dir: &Path, name: &str) {
         .unwrap_or(0);
     let path = debug_dir.join(format!("{ts}-{name}.png"));
     let _ = page.screenshot(&path).await;
-}
-
-async fn load_or_init_state(config: &Config) -> Result<StorageState, AppError> {
-    if config.state_file.exists() {
-        let raw = tokio::fs::read_to_string(&config.state_file)
-            .await
-            .map_err(|e| AppError::service_unavailable(format!("cannot read session file: {e}")))?;
-        let state: StorageState = serde_json::from_str(&raw)
-            .map_err(|e| AppError::service_unavailable(format!("invalid session file: {e}")))?;
-        if !state.cookies.is_empty() {
-            return Ok(state);
-        }
-    }
-
-    Err(AppError::service_unavailable(
-        "no session configured. Call POST /session first.",
-    ))
-}
-
-pub async fn save_storage_state(path: &Path, state: &StorageState) -> Result<(), AppError> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| AppError::bad_gateway(format!("failed to create data dir: {e}")))?;
-    }
-    let body = serde_json::to_string_pretty(state)
-        .map_err(|e| AppError::bad_gateway(format!("failed to serialize session: {e}")))?;
-    tokio::fs::write(path, body)
-        .await
-        .map_err(|e| AppError::bad_gateway(format!("failed to write session file: {e}")))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
 }
