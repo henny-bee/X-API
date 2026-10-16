@@ -2,8 +2,11 @@
 
 Stateless HTTP service written in Rust (Axum + Chrome DevTools Protocol) that posts text, images, and videos to X (`x.com`). Each request supplies its own X session cookie (`auth_token` and optional `ct0`), so multiple users and X accounts can share one deployment.
 
+<img width="1987" height="538" alt="image" src="https://github.com/user-attachments/assets/33b8fb4e-7214-43d9-9939-fb211efaba1f" />
+
+
 ```
-n8n / HTTP Client -> x-poster (Axum/Rust) -> Headless Chromium (CDP) -> x.com
+Client -> x-poster (Axum/Rust) -> Headless Chromium (CDP) -> x.com
 ```
 
 ## Project Structure
